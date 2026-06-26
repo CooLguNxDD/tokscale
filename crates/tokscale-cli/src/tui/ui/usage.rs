@@ -1299,7 +1299,10 @@ fn snapshot_line(app: &App, outputs: &[UsageOutput], width: usize) -> Line<'stat
 fn metric_detail_line(app: &App, metric: &UsageMetric, width: usize) -> Line<'static> {
     let remaining = remaining_label(metric);
     let label_width = metric_label_width(width);
-    let bar_width = width.saturating_sub(label_width + 25).clamp(10, 34);
+    let target_reset_width = width.saturating_sub(label_width + 12).min(24);
+    let bar_width = width
+        .saturating_sub(label_width + target_reset_width + 14)
+        .clamp(10, 34);
     let reset_width = width.saturating_sub(label_width + bar_width + 14);
     let reset = metric
         .resets_at
@@ -1414,21 +1417,36 @@ fn render_narrow_accounts_table(
     area: Rect,
     outputs: &[UsageOutput],
 ) {
-    let mut lines = vec![narrow_table_header(app, area.width)];
     let row_height = 2usize;
     let max_items = (area.height.saturating_sub(1) as usize / row_height).max(1);
     app.set_max_visible_items(max_items);
     let start = app
         .scroll_offset
         .min(outputs.len().saturating_sub(max_items));
-
-    for (visible_row, (index, output)) in outputs
+    let visible_rows = outputs
         .iter()
         .enumerate()
         .skip(start)
         .take(max_items)
-        .enumerate()
-    {
+        .collect::<Vec<_>>();
+
+    let rows = visible_rows
+        .iter()
+        .map(|(index, output)| narrow_table_row(app, output, *index, area))
+        .collect::<Vec<_>>();
+    let selected_visible = app
+        .selected_index
+        .checked_sub(start)
+        .filter(|index| *index < visible_rows.len());
+    let mut table_state = TableState::default().with_selected(selected_visible);
+    let table = Table::new(rows, [Constraint::Percentage(100)])
+        .header(Row::new([Cell::from(narrow_table_header(app, area.width))]))
+        .highlight_spacing(HighlightSpacing::Never)
+        .row_highlight_style(Style::default().bg(app.theme.selection))
+        .flex(Flex::Start);
+    frame.render_stateful_widget(table, area, &mut table_state);
+
+    for (visible_row, (index, _)) in visible_rows.into_iter().enumerate() {
         let y = area
             .y
             .saturating_add(1)
@@ -1442,10 +1460,7 @@ fn render_narrow_accounts_table(
             ),
             ClickAction::UsageSelect { index },
         );
-        lines.extend(narrow_table_row(app, output, index, area, y));
     }
-
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn account_table_header(app: &App) -> Row<'static> {
@@ -1479,7 +1494,7 @@ fn account_table_widths(width: u16) -> [Constraint; 8] {
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Min(30),
-            Constraint::Length(22),
+            Constraint::Length(24),
         ]
     } else {
         [
@@ -1490,18 +1505,12 @@ fn account_table_widths(width: u16) -> [Constraint; 8] {
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Min(24),
-            Constraint::Length(16),
+            Constraint::Length(24),
         ]
     }
 }
 
-fn narrow_table_row(
-    app: &mut App,
-    output: &UsageOutput,
-    index: usize,
-    area: Rect,
-    _y: u16,
-) -> Vec<Line<'static>> {
+fn narrow_table_row(app: &mut App, output: &UsageOutput, index: usize, area: Rect) -> Row<'static> {
     let selected = app.selected_index == index;
     let width = area.width as usize;
     let row = usage_row_view(app, output);
@@ -1517,7 +1526,8 @@ fn narrow_table_row(
     } else {
         0usize
     };
-    let left_width = width.saturating_sub(4 + state_width);
+    let state_right_padding = usize::from(state_width > 0) * 2;
+    let left_width = width.saturating_sub(4 + state_width + state_right_padding);
     let left = format!("{} {}", output.provider, row.account_summary);
     let mut first = vec![
         styled(
@@ -1537,8 +1547,17 @@ fn narrow_table_row(
     ];
     if state_width > 0 {
         first.push(styled(
-            truncate_string(&state, state_width),
+            format!(
+                "{:>width$}",
+                truncate_string(&state, state_width),
+                width = state_width
+            ),
             Style::default().fg(readiness_color(app, row.readiness)),
+            selected,
+        ));
+        first.push(styled(
+            " ".repeat(state_right_padding),
+            Style::default(),
             selected,
         ));
     }
@@ -1580,7 +1599,12 @@ fn narrow_table_row(
     }
     pad_selected_row(&mut second, area.width as usize, selected);
 
-    vec![Line::from(first), Line::from(second)]
+    Row::new([Cell::from(Text::from(vec![
+        Line::from(first),
+        Line::from(second),
+    ]))])
+    .style(account_table_row_style(app, index))
+    .height(2)
 }
 
 fn usage_row_view<'a>(app: &App, output: &'a UsageOutput) -> UsageRowView<'a> {
@@ -2889,6 +2913,33 @@ mod tests {
         assert!(body.contains("work"), "{body}");
         assert!(body.contains("personal"), "{body}");
         assert!(body.contains(" Remove "), "{body}");
+    }
+
+    #[test]
+    fn narrow_usage_account_status_keeps_right_padding() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+        )];
+
+        let body = render_body(&mut app, 90, 24);
+        let row = body
+            .lines()
+            .find(|line| {
+                line.contains("Codex") && line.contains("Active") && line.contains("Ready")
+            })
+            .expect("missing active narrow account row");
+        let ready_end = row.rfind("Ready").expect(row) + "Ready".len();
+
+        assert!(
+            row[ready_end..].starts_with("  "),
+            "expected right padding after Ready: {row:?}"
+        );
     }
 
     #[test]
