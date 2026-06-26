@@ -110,10 +110,6 @@ impl PricingService {
             // Source: Cursor docs (cursor.com/docs/models#model-pricing)
             ("composer-2.5", 5e-7, 2.5e-6, Some(2e-7)),
             ("composer-2.5-fast", 1.5e-6, 7.5e-6, Some(3.5e-7)),
-            // Gemini 3.5 Flash (reported by Antigravity CLI as "gemini-3-flash-a" etc.)
-            // Gemini Developer API Paid Tier: $1.50 input / $9.00 output / $0.15 cache read per 1M tokens.
-            // Source: user-provided Gemini Developer API pricing breakdown (2026).
-            ("gemini-3.5-flash", 1.5e-6, 9e-6, Some(1.5e-7)),
         ];
 
         let mut overrides = HashMap::with_capacity(entries.len());
