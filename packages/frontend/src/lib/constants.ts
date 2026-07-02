@@ -61,6 +61,10 @@ export const SOURCE_DISPLAY_NAMES: Record<ClientType, string> = {
   commandcode: "Command Code",
   micode: "MiMo Code",
   junie: "Junie",
+  zcode: "ZCode",
+  opencodereview: "OpenCodeReview",
+  codebuddy: "CodeBuddy",
+  workbuddy: "WorkBuddy",
 };
 
 // Client logos from GitHub CDN (public repo)
@@ -101,6 +105,12 @@ export const SOURCE_LOGOS: Record<ClientType, string> = {
     "https://raw.githubusercontent.com/CommandCodeAI/command-code/main/.github/commandcode/logo/command-code-logo-black-bg.png",
   micode: "https://github.com/XiaomiMiMo.png",
   junie: "https://github.com/JetBrains.png",
+  zcode: "https://github.com/zai-org.png",
+  opencodereview: "https://github.com/alibaba.png",
+  codebuddy:
+    "https://pc3.gtimg.com/softmgr/logo/48/43068_48_1764842447.png",
+  workbuddy:
+    "https://static.workbuddy.cn/web/agents/008054d6beaaf4a83e2d049e982e1244560726dc/assets/share-logo.png",
 };
 
 export const SOURCE_COLORS: Record<ClientType, string> = {
@@ -138,6 +148,10 @@ export const SOURCE_COLORS: Record<ClientType, string> = {
   commandcode: "#A855F7",
   micode: "#FF6900",
   junie: "#7B61FF",
+  zcode: "#3B5BDB",
+  opencodereview: "#FF6A00",
+  codebuddy: "#00A4FF",
+  workbuddy: "#2563EB",
 };
 
 export const SOURCE_TEXT_COLORS: Partial<Record<ClientType, string>> = {

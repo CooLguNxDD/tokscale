@@ -463,7 +463,7 @@ define_clients!(
     MiMoCode = 30 => {
         id: "micode",
         root: PathRoot::XdgData,
-        relative: "micode",
+        relative: "mimocode",
         pattern: "*.db",
         headless: false,
         parse_local: true,
@@ -501,6 +501,33 @@ define_clients!(
         root: PathRoot::Home,
         relative: ".zcode/projects",
         pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    OpenCodeReview = 34 => {
+        id: "opencodereview",
+        root: PathRoot::Home,
+        relative: ".opencodereview/sessions",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    CodeBuddy = 35 => {
+        id: "codebuddy",
+        root: PathRoot::Home,
+        relative: ".codebuddy/projects",
+        pattern: "*.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
+    },
+    WorkBuddy = 36 => {
+        id: "workbuddy",
+        root: PathRoot::Home,
+        relative: ".workbuddy",
+        pattern: "workbuddy.db",
         headless: false,
         parse_local: true,
         submit_default: true
@@ -556,7 +583,35 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 34);
+        assert_eq!(ClientId::COUNT, 37);
+    }
+
+    #[test]
+    fn test_codebuddy_client_registered_as_local_session_source() {
+        let client =
+            ClientId::from_str("codebuddy").expect("codebuddy client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.codebuddy/projects"
+        );
+        assert_eq!(client.data().pattern, "*.jsonl");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
+    }
+
+    #[test]
+    fn test_workbuddy_client_registered_as_local_sqlite_source() {
+        let client =
+            ClientId::from_str("workbuddy").expect("workbuddy client should be registered");
+        assert_eq!(
+            client.data().resolve_path("/tmp/home"),
+            "/tmp/home/.workbuddy"
+        );
+        assert_eq!(client.data().pattern, "workbuddy.db");
+        assert!(client.data().parse_local);
+        assert!(client.data().submit_default);
+        assert!(!client.data().headless);
     }
 
     #[test]

@@ -7,10 +7,12 @@ pub mod antigravity;
 pub mod antigravity_cli;
 pub mod claudecode;
 pub mod cline;
+pub mod codebuddy;
 pub mod codebuff;
 pub mod codex;
 pub mod commandcode;
 pub mod copilot;
+pub mod copilot_desktop;
 pub mod crush;
 pub mod cursor;
 pub mod droid;
@@ -29,17 +31,29 @@ pub mod micode;
 pub mod mux;
 pub mod openclaw;
 pub mod opencode;
+pub mod opencodereview;
 pub mod pi;
 pub mod qwen;
 pub mod roocode;
 pub mod synthetic;
+pub(crate) mod tencent_buddy;
 pub mod trae;
 pub(crate) mod utils;
 pub mod warp;
+pub mod workbuddy;
 pub mod zcode;
 pub mod zed;
 
 use crate::TokenBreakdown;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CostSource {
+    #[default]
+    Unknown,
+    ProviderReported,
+    Estimated,
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnifiedMessage {
@@ -53,6 +67,8 @@ pub struct UnifiedMessage {
     pub date: String,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    #[serde(default)]
+    pub cost_source: CostSource,
     #[serde(default)]
     pub duration_ms: Option<i64>,
     #[serde(default = "default_message_count")]
@@ -333,6 +349,7 @@ impl UnifiedMessage {
             date,
             tokens,
             cost,
+            cost_source: CostSource::Unknown,
             duration_ms: None,
             message_count: default_message_count(),
             agent,
@@ -357,6 +374,18 @@ impl UnifiedMessage {
     pub(crate) fn set_timestamp(&mut self, timestamp: i64) {
         self.timestamp = timestamp;
         self.refresh_derived_fields();
+    }
+
+    pub fn mark_provider_reported_cost(&mut self) {
+        self.cost_source = CostSource::ProviderReported;
+    }
+
+    pub(crate) fn mark_estimated_cost(&mut self) {
+        self.cost_source = CostSource::Estimated;
+    }
+
+    pub(crate) fn has_authoritative_cost(&self) -> bool {
+        self.cost_source == CostSource::ProviderReported
     }
 }
 

@@ -33,6 +33,10 @@ export const SUPPORTED_CLIENT_TYPES = [
   "micode",
   "antigravity-cli",
   "junie",
+  "zcode",
+  "opencodereview",
+  "codebuddy",
+  "workbuddy",
 ] as const;
 
 export type CcMirrorClientType = `cc-mirror/${string}`;

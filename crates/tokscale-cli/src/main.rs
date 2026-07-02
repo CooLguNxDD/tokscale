@@ -226,6 +226,11 @@ enum Commands {
         )]
         dry_run: bool,
     },
+    #[command(about = "Manage periodic usage submission")]
+    Autosubmit {
+        #[command(subcommand)]
+        subcommand: commands::autosubmit::AutosubmitSubcommand,
+    },
     #[command(about = "Capture subprocess output for token usage tracking")]
     Headless {
         #[arg(help = "Source CLI (currently only 'codex' supported)")]
@@ -333,6 +338,8 @@ enum Commands {
         summarizer: String,
         #[arg(long, help = "Reset all summaries and re-summarize from scratch")]
         rebuild: bool,
+        #[arg(long, help = "Show all sessions without truncation")]
+        full: bool,
     },
 }
 
@@ -681,7 +688,18 @@ fn main() -> Result<()> {
             // defaultClients view filter (which may exclude clients they still want
             // to upload). Pass an explicit empty defaults slice.
             let clients = build_client_filter_with_defaults(clients, &[]);
-            run_submit_command(clients, since, until, year, dry_run)
+            run_submit_command(
+                clients,
+                since,
+                until,
+                year,
+                dry_run,
+                SubmitMode::Interactive,
+            )
+        }
+        Some(Commands::Autosubmit { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "autosubmit")?;
+            run_autosubmit_command(subcommand)
         }
         Some(Commands::Headless {
             source,
@@ -771,6 +789,7 @@ fn main() -> Result<()> {
             no_summarize,
             summarizer,
             rebuild,
+            full,
         }) => {
             let today = date.today;
             let week = date.week;
@@ -790,6 +809,7 @@ fn main() -> Result<()> {
                 today,
                 week,
                 month,
+                full,
             })
         }
         None => {
@@ -895,6 +915,9 @@ pub enum ClientFilter {
     AntigravityCli,
     Junie,
     Zcode,
+    Opencodereview,
+    Codebuddy,
+    Workbuddy,
     Synthetic,
 }
 
@@ -938,6 +961,9 @@ impl ClientFilter {
             Self::AntigravityCli => "antigravity-cli",
             Self::Junie => "junie",
             Self::Zcode => "zcode",
+            Self::Opencodereview => "opencodereview",
+            Self::Codebuddy => "codebuddy",
+            Self::Workbuddy => "workbuddy",
             Self::Synthetic => "synthetic",
         }
     }
@@ -984,6 +1010,9 @@ impl ClientFilter {
             Self::AntigravityCli => Some(ClientId::AntigravityCli),
             Self::Junie => Some(ClientId::Junie),
             Self::Zcode => Some(ClientId::Zcode),
+            Self::Opencodereview => Some(ClientId::OpenCodeReview),
+            Self::Codebuddy => Some(ClientId::CodeBuddy),
+            Self::Workbuddy => Some(ClientId::WorkBuddy),
             Self::Synthetic => None,
         }
     }
@@ -1027,6 +1056,9 @@ impl ClientFilter {
             ClientId::AntigravityCli => Self::AntigravityCli,
             ClientId::Junie => Self::Junie,
             ClientId::Zcode => Self::Zcode,
+            ClientId::OpenCodeReview => Self::Opencodereview,
+            ClientId::CodeBuddy => Self::Codebuddy,
+            ClientId::WorkBuddy => Self::Workbuddy,
         }
     }
 
@@ -3507,6 +3539,8 @@ fn capitalize_client(client: &str) -> String {
         "commandcode" => "Command Code".to_string(),
         "junie" => "Junie".to_string(),
         "zcode" => "ZCode".to_string(),
+        "codebuddy" => "CodeBuddy".to_string(),
+        "workbuddy" => "WorkBuddy".to_string(),
         other => other.to_string(),
     }
 }
@@ -3622,7 +3656,7 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                     .data()
                     .resolve_path_with_env_strategy(&home_dir_str, use_env_roots);
                 let sessions_path_exists = Path::new(&sessions_path).exists();
-                let additional_paths: Vec<AdditionalPath> = built_in_extra_paths
+                let mut additional_paths: Vec<AdditionalPath> = built_in_extra_paths
                     .iter()
                     .filter(|(c, _)| *c == client)
                     .map(|(_, path)| AdditionalPath {
@@ -3630,6 +3664,13 @@ fn run_clients_command(json: bool, home_dir: Option<String>) -> Result<()> {
                         exists: path.exists(),
                     })
                     .collect();
+                if client == ClientId::Zcode {
+                    let path = home_dir.join(".zcode/cli/db/db.sqlite");
+                    additional_paths.push(AdditionalPath {
+                        path: path.to_string_lossy().to_string(),
+                        exists: path.exists(),
+                    });
+                }
                 let legacy_paths = if client == ClientId::OpenClaw {
                     vec![
                         LegacyPath {
@@ -4882,12 +4923,67 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
     println!();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitMode {
+    Interactive,
+    Autosubmit,
+}
+
+fn run_autosubmit_command(subcommand: commands::autosubmit::AutosubmitSubcommand) -> Result<()> {
+    use commands::autosubmit::{AutosubmitRunDecision, AutosubmitSubcommand};
+
+    match subcommand {
+        AutosubmitSubcommand::Enable(args) => commands::autosubmit::enable(args),
+        AutosubmitSubcommand::Status { json } => commands::autosubmit::status(json),
+        AutosubmitSubcommand::Disable => commands::autosubmit::disable(),
+        AutosubmitSubcommand::Run { force } => {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let (settings, decision) = commands::autosubmit::load_run_config(force, now_ms)?;
+            match decision {
+                AutosubmitRunDecision::Disabled => {
+                    println!("Autosubmit is disabled.");
+                    return Ok(());
+                }
+                AutosubmitRunDecision::NotDue { next_run_at_ms } => {
+                    println!(
+                        "Autosubmit is not due yet. Next run: {}.",
+                        commands::autosubmit::format_timestamp_ms(next_run_at_ms)
+                    );
+                    return Ok(());
+                }
+                AutosubmitRunDecision::Due => {}
+            }
+
+            let Some(_lock) = commands::autosubmit::try_acquire_run_lock()? else {
+                println!("Autosubmit is already running.");
+                return Ok(());
+            };
+
+            let (clients, since, until, year) = commands::autosubmit::submit_filters(&settings);
+            match run_submit_command(clients, since, until, year, false, SubmitMode::Autosubmit) {
+                Ok(()) => {
+                    commands::autosubmit::record_run_success(
+                        chrono::Utc::now().timestamp_millis(),
+                    )?;
+                    Ok(())
+                }
+                Err(err) => {
+                    let message = err.to_string();
+                    let _ = commands::autosubmit::record_run_error(&message);
+                    Err(err)
+                }
+            }
+        }
+    }
+}
+
 fn run_submit_command(
     clients: Option<Vec<String>>,
     since: Option<String>,
     until: Option<String>,
     year: Option<String>,
     dry_run: bool,
+    mode: SubmitMode,
 ) -> Result<()> {
     use colored::Colorize;
     use std::io::IsTerminal;
@@ -4897,6 +4993,11 @@ fn run_submit_command(
     let auth_token = match auth::resolve_api_token() {
         Some(token) => token,
         None => {
+            if mode == SubmitMode::Autosubmit {
+                return Err(anyhow::anyhow!(
+                    "Autosubmit requires login. Run `tokscale login` or set TOKSCALE_API_TOKEN."
+                ));
+            }
             eprintln!("\n  {}", "Not logged in.".yellow());
             eprintln!(
                 "{}",
@@ -4906,7 +5007,8 @@ fn run_submit_command(
         }
     };
 
-    if auth_token.source == auth::ApiTokenSource::StoredCredentials
+    if mode == SubmitMode::Interactive
+        && auth_token.source == auth::ApiTokenSource::StoredCredentials
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
@@ -5069,21 +5171,20 @@ fn run_submit_command(
                     });
 
             if !status.is_success() {
-                eprintln!(
-                    "\n  {}",
-                    format!(
-                        "Error: {}",
-                        body.error
-                            .unwrap_or_else(|| "Submission failed".to_string())
-                    )
-                    .red()
-                );
+                let error = body
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Submission failed".to_string());
+                eprintln!("\n  {}", format!("Error: {}", error).red());
                 if let Some(details) = body.details {
                     for detail in details {
                         eprintln!("{}", format!("    - {}", detail).bright_black());
                     }
                 }
                 println!();
+                if mode == SubmitMode::Autosubmit {
+                    return Err(anyhow::anyhow!(error));
+                }
                 std::process::exit(1);
             }
 
@@ -5141,6 +5242,9 @@ fn run_submit_command(
         Err(err) => {
             eprintln!("\n  {}", "Error: Failed to connect to server.".red());
             eprintln!("{}\n", format!("  {}", err).bright_black());
+            if mode == SubmitMode::Autosubmit {
+                return Err(anyhow::anyhow!("Failed to connect to server: {err}"));
+            }
             std::process::exit(1);
         }
     }
@@ -5148,7 +5252,9 @@ fn run_submit_command(
     // Warm the TUI cache so the next `tokscale` launch is instant.
     // Detached subprocess so submit returns to the shell immediately on large
     // datasets — a full re-scan would otherwise block for tens of seconds.
-    spawn_warm_tui_cache_detached();
+    if mode == SubmitMode::Interactive {
+        spawn_warm_tui_cache_detached();
+    }
 
     Ok(())
 }
@@ -6386,6 +6492,51 @@ mod tests {
     fn test_delete_submitted_data_command_parses() {
         let cli = Cli::try_parse_from(["tokscale", "delete-submitted-data"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::DeleteSubmittedData)));
+    }
+
+    #[test]
+    fn test_autosubmit_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "tokscale",
+            "autosubmit",
+            "enable",
+            "--interval",
+            "2h",
+            "--client",
+            "opencode,claude",
+            "--week",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Enable(_)
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "status", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Status { json: true }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "run", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Run { force: true }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["tokscale", "autosubmit", "disable"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Autosubmit {
+                subcommand: commands::autosubmit::AutosubmitSubcommand::Disable
+            })
+        ));
     }
 
     #[test]

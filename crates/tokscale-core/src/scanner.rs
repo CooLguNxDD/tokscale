@@ -81,6 +81,7 @@ pub struct ScanResult {
     /// `opencode-nightly.db`, etc. See upstream logic in opencode's
     /// `packages/opencode/src/storage/db.ts` (`getChannelPath`).
     pub opencode_dbs: Vec<PathBuf>,
+    pub copilot_desktop_db: Option<PathBuf>,
     pub synthetic_db: Option<PathBuf>,
     pub kilo_db: Option<PathBuf>,
     pub hermes_db: Option<PathBuf>,
@@ -88,6 +89,8 @@ pub struct ScanResult {
     pub zed_db: Option<PathBuf>,
     pub kiro_db: Option<PathBuf>,
     pub crush_dbs: Vec<CrushDbSource>,
+    /// ZCode v2 CLI usage database at `~/.zcode/cli/db/db.sqlite`.
+    pub zcode_db: Option<PathBuf>,
     /// MiMo Code SQLite databases discovered under the data dir.
     pub micode_dbs: Vec<PathBuf>,
     /// Path to the OpenCode legacy JSON directory (for migration cache stat checks)
@@ -99,6 +102,7 @@ impl Default for ScanResult {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
             opencode_dbs: Vec::new(),
+            copilot_desktop_db: None,
             synthetic_db: None,
             kilo_db: None,
             hermes_db: None,
@@ -106,6 +110,7 @@ impl Default for ScanResult {
             zed_db: None,
             kiro_db: None,
             crush_dbs: Vec::new(),
+            zcode_db: None,
             micode_dbs: Vec::new(),
             opencode_json_dir: None,
         }
@@ -264,6 +269,16 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "*.json" => file_name.ends_with(".json"),
                 "*.json|*.jsonl" => file_name.ends_with(".json") || file_name.ends_with(".jsonl"),
                 "*.jsonl" => file_name.ends_with(".jsonl"),
+                "*.log" => file_name.ends_with(".log"),
+                "codebuddy-extension-log" => {
+                    file_name.ends_with(".log")
+                        && path.components().any(|component| {
+                            component
+                                .as_os_str()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case("Tencent-Cloud.coding-copilot")
+                        })
+                }
                 // OpenClaw: also match archived transcripts
                 // (<uuid>.jsonl.deleted.<ts>, <uuid>.jsonl.reset.<ts>)
                 "*.jsonl*" => {
@@ -332,6 +347,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "ui_messages.json" => file_name == "ui_messages.json",
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
+                "workbuddy.db" => file_name == "workbuddy.db",
                 "state.db" => file_name == "state.db",
                 "threads.db" => file_name == "threads.db",
                 // Antigravity CLI conversation databases. `ends_with(".db")`
@@ -860,6 +876,86 @@ fn scan_all_clients_with_env_strategy_inner(
         push_unique_scan_task(&mut tasks, &mut seen_scan_roots, client_id, path);
     }
 
+    if enabled.contains(&ClientId::CodeBuddy) {
+        let home_path = PathBuf::from(home_dir);
+        let mut codebuddy_log_roots = vec![(
+            home_path
+                .join("AppData")
+                .join("Local")
+                .join("CodeBuddyExtension")
+                .join("Logs"),
+            "*.log",
+        )];
+        let roaming_codebuddy_roots = [
+            home_path
+                .join("AppData")
+                .join("Roaming")
+                .join("CodeBuddy CN")
+                .join("logs"),
+            home_path
+                .join("AppData")
+                .join("Roaming")
+                .join("Code")
+                .join("logs"),
+        ];
+        codebuddy_log_roots.extend(
+            roaming_codebuddy_roots
+                .into_iter()
+                .map(|root| (root, "codebuddy-extension-log")),
+        );
+        if use_env_roots {
+            if let Some(local_app_data) = dirs::data_local_dir() {
+                codebuddy_log_roots.push((
+                    local_app_data.join("CodeBuddyExtension").join("Logs"),
+                    "*.log",
+                ));
+            }
+            if let Some(roaming_app_data) = dirs::config_dir() {
+                codebuddy_log_roots.push((
+                    roaming_app_data.join("CodeBuddy CN").join("logs"),
+                    "codebuddy-extension-log",
+                ));
+                codebuddy_log_roots.push((
+                    roaming_app_data.join("Code").join("logs"),
+                    "codebuddy-extension-log",
+                ));
+            }
+        }
+
+        for (log_root, pattern) in codebuddy_log_roots {
+            if pattern == "*.log" {
+                for root in ["CodeBuddyIDE", "VSCode"] {
+                    push_unique_scan_task_with_pattern(
+                        &mut tasks,
+                        &mut seen_scan_roots,
+                        ClientId::CodeBuddy,
+                        log_root.join(root),
+                        pattern,
+                    );
+                }
+                continue;
+            }
+
+            push_unique_scan_task_with_pattern(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::CodeBuddy,
+                log_root,
+                pattern,
+            );
+        }
+    }
+
+    if enabled.contains(&ClientId::WorkBuddy) {
+        push_unique_scan_task_with_pattern(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::WorkBuddy,
+            PathBuf::from(home_dir).join(".workbuddy/projects"),
+            "*.jsonl",
+        );
+    }
+
     // Extra scan directories are part of the caller's environment, so they are
     // intentionally ignored when an explicit --home override disables env roots.
     if use_env_roots {
@@ -915,14 +1011,16 @@ fn scan_all_clients_with_env_strategy_inner(
         );
     }
 
-    // MiMo Code: SQLite database(s) at ~/.local/share/micode/mimocode*.db
+    // MiMo Code: SQLite database(s) at ~/.local/share/mimocode/mimocode*.db
     if enabled.contains(&ClientId::MiMoCode) {
-        let micode_xdg_data = if use_env_roots {
-            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home_dir))
-        } else {
-            format!("{}/.local/share", home_dir)
-        };
-        let micode_data_dir = PathBuf::from(format!("{}/micode", micode_xdg_data));
+        // Derive the data dir from the client metadata so the scan path stays
+        // in sync with `ClientId::MiMoCode` (XdgData root + `mimocode`) rather
+        // than duplicating it here.
+        let micode_data_dir = PathBuf::from(
+            ClientId::MiMoCode
+                .data()
+                .resolve_path_with_env_strategy(home_dir, use_env_roots),
+        );
         // `discover_micode_dbs` already returns a sorted list.
         result.micode_dbs = discover_micode_dbs(&micode_data_dir);
     }
@@ -1205,6 +1303,13 @@ fn scan_all_clients_with_env_strategy_inner(
         result.crush_dbs = discover_crush_dbs(home_dir, use_env_roots);
     }
 
+    if enabled.contains(&ClientId::Zcode) {
+        let zcode_db_path = PathBuf::from(format!("{}/.zcode/cli/db/db.sqlite", home_dir));
+        if zcode_db_path.is_file() {
+            result.zcode_db = Some(zcode_db_path);
+        }
+    }
+
     if enabled.contains(&ClientId::Kiro) {
         let kiro_cli_path = ClientId::Kiro
             .data()
@@ -1352,6 +1457,11 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     if enabled.contains(&ClientId::Copilot) {
+        let desktop_db = PathBuf::from(format!("{}/.copilot/data.db", home_dir));
+        if desktop_db.is_file() {
+            result.copilot_desktop_db = Some(desktop_db);
+        }
+
         if let Some(path) = copilot_exporter_path_with_env_strategy(use_env_roots) {
             if path.is_file() && seen.insert(path.clone()) {
                 let copilot_files = result.get_mut(ClientId::Copilot);
@@ -1510,6 +1620,34 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_directory_log_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("ide.log")).unwrap();
+        File::create(path.join("vscode.log")).unwrap();
+        File::create(path.join("session.jsonl")).unwrap();
+
+        let log_files = scan_directory(path.to_str().unwrap(), "*.log");
+        assert_eq!(log_files.len(), 2);
+        assert!(log_files.iter().all(|p| p.extension().unwrap() == "log"));
+    }
+
+    #[test]
+    fn test_scan_directory_workbuddy_db_pattern() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
+
+        File::create(path.join("workbuddy.db")).unwrap();
+        File::create(path.join("workbuddy.db-wal")).unwrap();
+        File::create(path.join("workbuddy.db-shm")).unwrap();
+
+        let db_files = scan_directory(path.to_str().unwrap(), "workbuddy.db");
+
+        assert_eq!(db_files, vec![path.join("workbuddy.db")]);
+    }
+
+    #[test]
     fn test_scan_directory_updates_jsonl_pattern() {
         let dir = TempDir::new().unwrap();
         let path = dir.path();
@@ -1648,6 +1786,79 @@ mod tests {
     fn test_scan_directory_nonexistent() {
         let files = scan_directory("/nonexistent/path/that/does/not/exist", "*.json");
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_zcode_v2_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let db_dir = dir.path().join(".zcode/cli/db");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join("db.sqlite");
+        File::create(&db_path).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["zcode".to_string()],
+            false,
+        );
+
+        assert_eq!(result.zcode_db.as_deref(), Some(db_path.as_path()));
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_codebuddy_extension_logs() {
+        let dir = TempDir::new().unwrap();
+        let ide_dir = dir
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("CodeBuddyExtension")
+            .join("Logs")
+            .join("CodeBuddyIDE")
+            .join("2026-07-01");
+        let vscode_dir = dir
+            .path()
+            .join("AppData")
+            .join("Local")
+            .join("CodeBuddyExtension")
+            .join("Logs")
+            .join("VSCode")
+            .join("2026-07-01");
+        fs::create_dir_all(&ide_dir).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let ide_log = ide_dir.join("ide.log");
+        let vscode_log = vscode_dir.join("vscode.log");
+        File::create(&ide_log).unwrap();
+        File::create(&vscode_log).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["codebuddy".to_string()],
+            false,
+        );
+
+        let files = result.get(ClientId::CodeBuddy);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&ide_log));
+        assert!(files.contains(&vscode_log));
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_workbuddy_project_jsonl() {
+        let dir = TempDir::new().unwrap();
+        let project_dir = dir.path().join(".workbuddy/projects/project-a");
+        fs::create_dir_all(&project_dir).unwrap();
+        let session = project_dir.join("session.jsonl");
+        File::create(&session).unwrap();
+
+        let result = scan_all_clients_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["workbuddy".to_string()],
+            false,
+        );
+
+        let files = result.get(ClientId::WorkBuddy);
+        assert_eq!(files.as_slice(), std::slice::from_ref(&session));
     }
 
     #[test]

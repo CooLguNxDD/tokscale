@@ -24,7 +24,7 @@ pub use sessionize::{
     compute_daily_active_time, compute_time_metrics, sessionize, SessionInterval, TimeMetrics,
     DEFAULT_IDLE_GAP_MS,
 };
-pub use sessions::UnifiedMessage;
+pub use sessions::{CostSource, UnifiedMessage};
 
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -1017,6 +1017,23 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             source_cache.insert(entry);
         }
     }
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        let otel_sessions: HashSet<String> = all_messages
+            .iter()
+            .filter(|message| message.client == "copilot")
+            .map(|message| message.session_id.clone())
+            .collect();
+        let desktop_msgs = sessions::copilot_desktop::parse_copilot_desktop_db(db_path);
+        all_messages.extend(
+            desktop_msgs
+                .into_iter()
+                .filter(|message| !otel_sessions.contains(&message.session_id))
+                .map(|mut message| {
+                    apply_pricing_if_available(&mut message, pricing);
+                    message
+                }),
+        );
+    }
 
     let gemini_outcomes: Vec<(PathBuf, CachedParseOutcome)> = scan_result
         .get(ClientId::Gemini)
@@ -1080,9 +1097,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .get(ClientId::Grok)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache, pricing, |path| {
-                sessions::grok::parse_grok_updates_file(path)
-            })
+            // Use a Grok-aware fingerprint: parse output depends on the sibling
+            // signals.json rollup, so that file must participate in the cache key
+            // or a late/updated rollup is ignored forever for cached sessions.
+            load_or_parse_source_with_fingerprint(
+                path,
+                &source_cache,
+                pricing,
+                message_cache::SourceFingerprint::from_grok_path,
+                sessions::grok::parse_grok_updates_file,
+            )
         })
         .collect();
     for outcome in grok_outcomes {
@@ -1275,6 +1299,21 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             .filter(|message| should_keep_deduped_message(&mut junie_seen, message)),
     );
 
+    // ZCode v2 CLI stores authoritative model usage in SQLite.
+    if let Some(db_path) = &scan_result.zcode_db {
+        let CachedParseOutcome {
+            messages,
+            cache_entry,
+            ..
+        } = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
+            sessions::zcode::parse_zcode_sqlite(path)
+        });
+        all_messages.extend(messages);
+        if let Some(entry) = cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     // ZCode (Z.ai GLM-5.2 ADE) JSONL sessions. Token usage may be embedded
     // from the API response; otherwise estimated from content.
     let zcode_messages: Vec<UnifiedMessage> = scan_result
@@ -1457,12 +1496,19 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             })
         })
         .collect();
+    // Collect Kiro file messages before extending so snapshot suppression can
+    // see execution coverage across files (it is a cross-file merge concern,
+    // like merge_workbuddy_messages, and must run after cache loads).
+    let mut kiro_file_messages: Vec<UnifiedMessage> = Vec::new();
     for outcome in kiro_outcomes {
-        all_messages.extend(outcome.messages);
+        kiro_file_messages.extend(outcome.messages);
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
     }
+    all_messages.extend(sessions::kiro::suppress_snapshots_covered_by_executions(
+        kiro_file_messages,
+    ));
 
     if let Some(db_path) = &scan_result.kiro_db {
         let kiro_db_messages: Vec<UnifiedMessage> = sessions::kiro::parse_kiro_sqlite(db_path)
@@ -1526,6 +1572,64 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         .collect();
     let deduped_trae_messages = dedupe_latest_trae_messages(trae_messages);
     all_messages.extend(deduped_trae_messages);
+
+    let codebuddy_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::CodeBuddy)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
+                sessions::codebuddy::parse_codebuddy_file(path)
+            })
+        })
+        .collect();
+    let mut codebuddy_seen: HashSet<String> = HashSet::new();
+    for outcome in codebuddy_outcomes {
+        all_messages.extend(outcome.messages.into_iter().filter(|message| {
+            message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| codebuddy_seen.insert(key.clone()))
+        }));
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    let (workbuddy_detailed_paths, workbuddy_fallback_paths) =
+        partition_workbuddy_paths(scan_result.get(ClientId::WorkBuddy));
+    let workbuddy_detailed_outcomes: Vec<CachedParseOutcome> = workbuddy_detailed_paths
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
+                sessions::workbuddy::parse_workbuddy_file(path)
+            })
+        })
+        .collect();
+    let workbuddy_fallback_outcomes: Vec<CachedParseOutcome> = workbuddy_fallback_paths
+        .par_iter()
+        .map(|path| {
+            load_or_parse_sqlite_source(path, &source_cache, pricing, |path| {
+                sessions::workbuddy::parse_workbuddy_file(path)
+            })
+        })
+        .collect();
+    let mut workbuddy_detailed_messages = Vec::new();
+    for outcome in workbuddy_detailed_outcomes {
+        workbuddy_detailed_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    let mut workbuddy_fallback_messages = Vec::new();
+    for outcome in workbuddy_fallback_outcomes {
+        workbuddy_fallback_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+    all_messages.extend(merge_workbuddy_messages(
+        workbuddy_detailed_messages,
+        workbuddy_fallback_messages,
+    ));
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
@@ -1595,6 +1699,44 @@ fn dedupe_latest_trae_messages(mut messages: Vec<UnifiedMessage>) -> Vec<Unified
             .then_with(|| a.timestamp.cmp(&b.timestamp))
     });
     deduped
+}
+
+fn partition_workbuddy_paths(paths: &[PathBuf]) -> (Vec<&PathBuf>, Vec<&PathBuf>) {
+    paths
+        .iter()
+        .partition(|path| sessions::workbuddy::is_detailed_workbuddy_source(path))
+}
+
+fn merge_workbuddy_messages(
+    detailed_messages: Vec<UnifiedMessage>,
+    fallback_messages: Vec<UnifiedMessage>,
+) -> Vec<UnifiedMessage> {
+    // The SQLite fallback carries ONE cumulative row per session (dated solely by
+    // `updated_at`), while the detailed JSONL carries accurate per-message rows.
+    // A fallback row is redundant exactly when its session already has detailed
+    // coverage — independent of which calendar day `updated_at` lands on. Keying
+    // this on the session (not the date) fixes two failures of the old
+    // date-overlap check: it no longer double-counts a session whose aggregate
+    // lands on a day with no detailed rows, and no longer drops a fallback-only
+    // session that merely shares a day with unrelated detailed activity. Both
+    // parsers derive `session_id` from the same WorkBuddy session identifier, so
+    // the keys are directly comparable.
+    let detailed_sessions: HashSet<String> = detailed_messages
+        .iter()
+        .filter(|message| !message.session_id.is_empty())
+        .map(|message| message.session_id.clone())
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut merged: Vec<UnifiedMessage> = detailed_messages
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut seen, message))
+        .collect();
+
+    merged.extend(fallback_messages.into_iter().filter(|message| {
+        !detailed_sessions.contains(&message.session_id)
+            && should_keep_deduped_message(&mut seen, message)
+    }));
+    merged
 }
 
 fn filter_unified_messages(
@@ -2159,6 +2301,10 @@ fn apply_pricing_if_available(
     message: &mut UnifiedMessage,
     pricing: Option<&pricing::PricingService>,
 ) {
+    if message.has_authoritative_cost() {
+        return;
+    }
+
     let Some(pricing) = pricing else {
         return;
     };
@@ -2171,6 +2317,7 @@ fn apply_pricing_if_available(
 
     if calculated_cost > 0.0 {
         message.cost = calculated_cost;
+        message.mark_estimated_cost();
     }
 }
 
@@ -2378,16 +2525,28 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Codex, codex_count);
     messages.extend(codex_msgs);
 
-    let copilot_msgs: Vec<ParsedMessage> = scan_result
+    let mut copilot_unified_msgs: Vec<_> = scan_result
         .get(ClientId::Copilot)
         .par_iter()
         .flat_map(|path| {
             sessions::copilot::parse_copilot_file(path)
                 .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
                 .collect::<Vec<_>>()
         })
         .collect();
+    if let Some(db_path) = &scan_result.copilot_desktop_db {
+        let otel_sessions: HashSet<String> = copilot_unified_msgs
+            .iter()
+            .map(|message| message.session_id.clone())
+            .collect();
+        copilot_unified_msgs.extend(
+            sessions::copilot_desktop::parse_copilot_desktop_db(db_path)
+                .into_iter()
+                .filter(|message| !otel_sessions.contains(&message.session_id)),
+        );
+    }
+    let copilot_msgs: Vec<ParsedMessage> =
+        copilot_unified_msgs.iter().map(unified_to_parsed).collect();
     let copilot_count = copilot_msgs.len() as i32;
     counts.set(ClientId::Copilot, copilot_count);
     messages.extend(copilot_msgs);
@@ -2529,16 +2688,42 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Junie, junie_count);
     messages.extend(junie_msgs);
 
-    // ZCode (Z.ai GLM-5.2 ADE) session transcripts
-    let zcode_msgs: Vec<ParsedMessage> = scan_result
-        .get(ClientId::Zcode)
-        .par_iter()
-        .flat_map(|path| sessions::zcode::parse_zcode_file(path))
-        .map(|message| unified_to_parsed(&message))
-        .collect();
+    // ZCode v2 CLI SQLite usage plus legacy JSONL session transcripts.
+    let mut zcode_msgs: Vec<ParsedMessage> = scan_result
+        .zcode_db
+        .as_ref()
+        .map(|db_path| {
+            sessions::zcode::parse_zcode_sqlite(db_path)
+                .into_iter()
+                .map(|message| unified_to_parsed(&message))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    zcode_msgs.extend(
+        scan_result
+            .get(ClientId::Zcode)
+            .par_iter()
+            .flat_map(|path| sessions::zcode::parse_zcode_file(path))
+            .map(|message| unified_to_parsed(&message))
+            .collect::<Vec<_>>(),
+    );
     let zcode_count = summed_parsed_message_count(&zcode_msgs);
     counts.set(ClientId::Zcode, zcode_count);
     messages.extend(zcode_msgs);
+
+    let opencodereview_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::OpenCodeReview)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::opencodereview::parse_opencodereview_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let opencodereview_count = summed_parsed_message_count(&opencodereview_msgs);
+    counts.set(ClientId::OpenCodeReview, opencodereview_count);
+    messages.extend(opencodereview_msgs);
 
     // Parse Kimi wire.jsonl files in parallel
     let kimi_msgs: Vec<ParsedMessage> = scan_result
@@ -2680,16 +2865,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         messages.extend(zed_msgs);
     }
 
-    let kiro_msgs: Vec<ParsedMessage> = scan_result
+    let kiro_unified: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Kiro)
         .par_iter()
-        .flat_map(|path| {
-            sessions::kiro::parse_kiro_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::kiro::parse_kiro_file(path))
         .collect();
+    let kiro_msgs: Vec<ParsedMessage> =
+        sessions::kiro::suppress_snapshots_covered_by_executions(kiro_unified)
+            .iter()
+            .map(unified_to_parsed)
+            .collect();
     let kiro_count = summed_parsed_message_count(&kiro_msgs);
     counts.set(ClientId::Kiro, kiro_count);
     messages.extend(kiro_msgs);
@@ -2779,6 +2964,44 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let warp_count = summed_parsed_message_count(&warp_msgs);
     counts.set(ClientId::Warp, warp_count);
     messages.extend(warp_msgs);
+
+    let codebuddy_msgs_raw: Vec<UnifiedMessage> = scan_result
+        .get(ClientId::CodeBuddy)
+        .par_iter()
+        .flat_map(|path| sessions::codebuddy::parse_codebuddy_file(path))
+        .collect();
+    let mut codebuddy_seen: HashSet<String> = HashSet::new();
+    let codebuddy_msgs: Vec<ParsedMessage> = codebuddy_msgs_raw
+        .into_iter()
+        .filter(|message| {
+            message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| codebuddy_seen.insert(key.clone()))
+        })
+        .map(|msg| unified_to_parsed(&msg))
+        .collect();
+    let codebuddy_count = summed_parsed_message_count(&codebuddy_msgs);
+    counts.set(ClientId::CodeBuddy, codebuddy_count);
+    messages.extend(codebuddy_msgs);
+    let (workbuddy_detailed_paths, workbuddy_fallback_paths) =
+        partition_workbuddy_paths(scan_result.get(ClientId::WorkBuddy));
+    let workbuddy_detailed_messages: Vec<UnifiedMessage> = workbuddy_detailed_paths
+        .par_iter()
+        .flat_map(|path| sessions::workbuddy::parse_workbuddy_file(path))
+        .collect();
+    let workbuddy_fallback_messages: Vec<UnifiedMessage> = workbuddy_fallback_paths
+        .par_iter()
+        .flat_map(|path| sessions::workbuddy::parse_workbuddy_file(path))
+        .collect();
+    let workbuddy_msgs: Vec<ParsedMessage> =
+        merge_workbuddy_messages(workbuddy_detailed_messages, workbuddy_fallback_messages)
+            .into_iter()
+            .map(|msg| unified_to_parsed(&msg))
+            .collect();
+    let workbuddy_count = summed_parsed_message_count(&workbuddy_msgs);
+    counts.set(ClientId::WorkBuddy, workbuddy_count);
+    messages.extend(workbuddy_msgs);
 
     let grok_msgs: Vec<ParsedMessage> = scan_result
         .get(ClientId::Grok)
@@ -2938,6 +3161,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
             reasoning: msg.reasoning,
         },
         cost,
+        cost_source: CostSource::Unknown,
         duration_ms: msg.duration_ms,
         message_count: msg.message_count,
         agent: msg.agent.clone(),
@@ -2951,10 +3175,10 @@ mod tests {
     use super::{
         aggregate_model_usage_entries, apply_pricing_if_available, dedupe_latest_trae_messages,
         generate_graph_with_loaded_pricing, message_cache, normalize_model_for_grouping,
-        parse_all_messages_with_pricing, parse_local_clients, parsed_to_unified, pricing,
-        retain_for_requested_clients, scanner, select_local_parse_pricing, unified_to_parsed,
-        ClientId, GroupBy, LocalParseOptions, ReportOptions, TokenBreakdown, UnifiedMessage,
-        UNKNOWN_WORKSPACE_LABEL,
+        parse_all_messages_with_pricing, parse_all_messages_with_pricing_with_env_strategy,
+        parse_local_clients, parsed_to_unified, pricing, retain_for_requested_clients, scanner,
+        select_local_parse_pricing, unified_to_parsed, ClientId, GroupBy, LocalParseOptions,
+        ReportOptions, TokenBreakdown, UnifiedMessage, UNKNOWN_WORKSPACE_LABEL,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -3007,6 +3231,31 @@ mod tests {
         msg
     }
 
+    fn make_workbuddy_message(
+        session_id: &str,
+        timestamp: i64,
+        input: i64,
+        dedup_key: &str,
+    ) -> UnifiedMessage {
+        let mut msg = UnifiedMessage::new(
+            "workbuddy",
+            "glm-5.2",
+            "zai",
+            session_id,
+            timestamp,
+            TokenBreakdown {
+                input,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+        msg.dedup_key = Some(dedup_key.to_string());
+        msg
+    }
+
     fn make_trae_message(
         session_id: &str,
         timestamp: i64,
@@ -3029,6 +3278,56 @@ mod tests {
             cost,
             dedup_key.map(str::to_string),
         )
+    }
+
+    #[test]
+    fn workbuddy_fallback_dedups_by_session_not_date() {
+        const DAY1: i64 = 1_782_883_200_000;
+        const DAY2: i64 = 1_782_969_600_000;
+
+        // Session A has detailed coverage on DAY1.
+        let detailed = vec![make_workbuddy_message(
+            "sess-A",
+            DAY1,
+            100,
+            "workbuddy:detailed-A",
+        )];
+        let fallback = vec![
+            // Session A's cumulative SQLite aggregate is dated DAY2 (updated_at)
+            // even though its detailed activity was DAY1. The old date-overlap
+            // check kept it, double-counting the whole session on DAY2.
+            make_workbuddy_message("sess-A", DAY2, 5000, "workbuddy:fallback-A"),
+            // Session B has NO detailed coverage but its aggregate shares DAY1
+            // with session A's detail. The old check dropped it, losing usage.
+            make_workbuddy_message("sess-B", DAY1, 2000, "workbuddy:fallback-B"),
+        ];
+
+        let merged = super::merge_workbuddy_messages(detailed, fallback);
+
+        // Detailed A kept; fallback A dropped (session covered); fallback B kept.
+        assert_eq!(merged.len(), 2);
+        assert!(merged
+            .iter()
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:detailed-A")));
+        assert!(merged
+            .iter()
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-B")));
+        assert!(!merged
+            .iter()
+            .any(|message| message.dedup_key.as_deref() == Some("workbuddy:fallback-A")));
+    }
+
+    #[test]
+    fn workbuddy_fallback_kept_when_no_detailed_messages() {
+        // With zero detailed coverage, every fallback session survives.
+        let fallback = vec![
+            make_workbuddy_message("sess-A", 1_782_883_200_000, 1000, "workbuddy:fallback-A"),
+            make_workbuddy_message("sess-B", 1_782_969_600_000, 2000, "workbuddy:fallback-B"),
+        ];
+
+        let merged = super::merge_workbuddy_messages(Vec::new(), fallback);
+
+        assert_eq!(merged.len(), 2);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3868,7 +4167,7 @@ mod tests {
         std::env::set_var("HOME", cache_home.path());
 
         {
-            let micode_dir = source_home.path().join(".local/share/micode");
+            let micode_dir = source_home.path().join(".local/share/mimocode");
             std::fs::create_dir_all(&micode_dir).unwrap();
             let db_path = micode_dir.join("mimocode.db");
 
@@ -6375,6 +6674,136 @@ mod tests {
         assert_eq!(parsed.messages[0].model_id, "deepseek-v3-0324");
         // Provider is canonicalized by the opencode parser (fireworks -> fireworks_ai).
         assert_eq!(parsed.messages[0].provider_id, "fireworks_ai");
+    }
+
+    #[test]
+    fn test_opencode_embedded_cost_reprices_when_pricing_exists() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let message_dir = temp_dir
+            .path()
+            .join(".local/share/opencode/storage/message/project-1");
+        std::fs::create_dir_all(&message_dir).unwrap();
+        std::fs::write(
+            message_dir.join("msg_reported.json"),
+            r#"{"id":"msg-reported","sessionID":"session-1","role":"assistant","modelID":"gpt-4o","providerID":"openai","cost":0.05,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            message_dir.join("msg_missing.json"),
+            r#"{"id":"msg-missing","sessionID":"session-1","role":"assistant","modelID":"gpt-4o","providerID":"openai","tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011201000}}"#,
+        )
+        .unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            temp_dir.path().to_str().unwrap(),
+            &["opencode".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+
+        let embedded = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("msg-reported"))
+            .expect("embedded-cost message should parse");
+        let missing = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("msg-missing"))
+            .expect("missing-cost message should parse");
+        assert_eq!(embedded.cost, 0.2);
+        assert_eq!(missing.cost, 0.2);
+    }
+
+    #[test]
+    fn test_gjc_explicit_zero_cost_is_preserved_while_absent_cost_reprices() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join(".gjc/agent/sessions/project-1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("session.jsonl"),
+            r#"{"type":"session","id":"gjc_ses_cost","cwd":"/work/project-1"}
+{"type":"message","id":"msg_zero","message":{"role":"assistant","model":"gpt-4o","provider":"openai","timestamp":1733011200000,"usage":{"input":10,"output":5,"cost":{"total":0.0}}}}
+{"type":"message","id":"msg_absent","message":{"role":"assistant","model":"gpt-4o","provider":"openai","timestamp":1733011201000,"usage":{"input":10,"output":5}}}"#,
+        )
+        .unwrap();
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-4o".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            temp_dir.path().to_str().unwrap(),
+            &["gjc".to_string()],
+            Some(&pricing),
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+
+        let explicit_zero = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("gjc_ses_cost:msg_zero"))
+            .expect("explicit-zero message should parse");
+        let absent = messages
+            .iter()
+            .find(|message| message.dedup_key.as_deref() == Some("gjc_ses_cost:msg_absent"))
+            .expect("absent-cost message should parse");
+        assert_eq!(explicit_zero.cost, 0.0);
+        assert_eq!(absent.cost, 0.2);
+    }
+
+    #[test]
+    fn test_gjc_idless_replay_dedup_stable_across_ordinal_shift() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let session_dir = temp_dir.path().join(".gjc/agent/sessions/project-1");
+        let child_dir = session_dir.join("session");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let assistant_line = r#"{"type":"message","message":{"role":"assistant","model":"gpt-4o","provider":"openai","timestamp":1733011200000,"usage":{"input":10,"output":5,"cost":{"total":0.03}}}}"#;
+        std::fs::write(
+            session_dir.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"session","id":"gjc_ses_replay_idless","cwd":"/work/project-1"}"#,
+                assistant_line
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            child_dir.join("1-replay.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session","id":"gjc_ses_replay_idless","cwd":"/work/project-1"}"#,
+                r#"{"type":"service_tier_change","tier":"pro"}"#,
+                assistant_line
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_all_messages_with_pricing_with_env_strategy(
+            temp_dir.path().to_str().unwrap(),
+            &["gjc".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].cost, 0.03);
     }
 
     #[test]

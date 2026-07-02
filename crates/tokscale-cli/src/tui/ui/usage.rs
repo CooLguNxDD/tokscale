@@ -2,7 +2,9 @@ use ratatui::layout::Flex;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 
-use crate::commands::usage::{helpers, UsageMetric, UsageOutput};
+use crate::commands::usage::{
+    helpers, UsageFetchDiagnostic, UsageFetchDiagnosticSeverity, UsageMetric, UsageOutput,
+};
 use crate::tui::app::{App, ClickAction};
 use crate::tui::codex_login::CodexLoginOutcome;
 use crate::tui::privacy::looks_like_email;
@@ -100,14 +102,25 @@ fn status_label(app: &App) -> String {
     let inventory = usage_inventory(&app.subscription_usage);
 
     if inventory.providers == 0 && app.usage_fetch_attempted {
-        "No data".to_string()
+        if app.usage_fetch_diagnostics.is_empty() {
+            "No data".to_string()
+        } else {
+            usage_issue_count_label(app.usage_fetch_diagnostics.len())
+        }
     } else if inventory.providers == 0 {
         "Not loaded".to_string()
-    } else {
+    } else if app.usage_fetch_diagnostics.is_empty() {
         format!(
             "{} providers · {}",
             inventory.providers,
             identity_count_label(inventory.saved, inventory.managed)
+        )
+    } else {
+        format!(
+            "{} providers · {} · {}",
+            inventory.providers,
+            identity_count_label(inventory.saved, inventory.managed),
+            usage_issue_count_label(app.usage_fetch_diagnostics.len())
         )
     }
 }
@@ -135,6 +148,13 @@ fn identity_count_label(saved: usize, managed: usize) -> String {
         (saved, 0) => format!("{saved} saved"),
         (0, managed) => format!("{managed} managed"),
         (saved, managed) => format!("{saved} saved · {managed} managed"),
+    }
+}
+
+fn usage_issue_count_label(count: usize) -> String {
+    match count {
+        1 => "1 issue".to_string(),
+        count => format!("{count} issues"),
     }
 }
 
@@ -435,15 +455,49 @@ fn render_ready(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_empty(frame: &mut Frame, app: &App, area: Rect) {
-    let center = centered_rect(area, 3);
-    let message = if area.width < 40 {
-        "No usage data"
+    let center = centered_rect(area, 4);
+    let lines = if let Some(diagnostic) = app.usage_fetch_diagnostics.first() {
+        if area.width < 40 {
+            vec![
+                Line::from(Span::styled(
+                    "Usage fetch failed",
+                    Style::default().fg(app.theme.muted),
+                )),
+                Line::from(Span::styled(
+                    truncate_string(&diagnostic.display_name(), area.width as usize),
+                    Style::default().fg(diagnostic_severity_color(diagnostic.severity)),
+                )),
+            ]
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    "Usage fetch failed",
+                    Style::default()
+                        .fg(app.theme.foreground)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    truncate_string(&diagnostic.display_name(), area.width as usize),
+                    Style::default().fg(diagnostic_severity_color(diagnostic.severity)),
+                )),
+                Line::from(Span::styled(
+                    truncate_string(&diagnostic.message, area.width as usize),
+                    Style::default().fg(app.theme.muted),
+                )),
+            ]
+        }
+    } else if area.width < 40 {
+        vec![Line::from(Span::styled(
+            "No usage data",
+            Style::default().fg(app.theme.muted),
+        ))]
     } else {
-        "No subscription data available"
+        vec![Line::from(Span::styled(
+            "No subscription data available",
+            Style::default().fg(app.theme.muted),
+        ))]
     };
-    let paragraph = Paragraph::new(message)
-        .style(Style::default().fg(app.theme.muted))
-        .alignment(Alignment::Center);
+    let paragraph = Paragraph::new(lines).alignment(Alignment::Center);
     frame.render_widget(paragraph, center);
 }
 
@@ -500,9 +554,25 @@ fn render_loaded(frame: &mut Frame, app: &mut App, area: Rect, outputs: &[UsageO
 }
 
 fn render_medium_loaded(frame: &mut Frame, app: &mut App, area: Rect, outputs: &[UsageOutput]) {
+    let selected_index = app.selected_index;
+    let selected = &outputs[selected_index];
     let summary_height = if area.height >= 36 { 8 } else { 6 }.min(area.height);
-    let selected_height =
-        if area.height >= 36 { 11 } else { 9 }.min(area.height.saturating_sub(summary_height));
+    let base_selected_height = if area.height >= 36 { 11 } else { 9 };
+    // Reserve enough rows for the accounts table's borders + header + a
+    // handful of account rows so the dynamic selected-panel height can only
+    // grow into space that is genuinely spare, never collapsing the table.
+    let accounts_table_min_height: u16 = 9;
+    let selected_height = if has_available_reset_credit(selected) {
+        let max_dynamic_height = area
+            .height
+            .saturating_sub(summary_height)
+            .saturating_sub(accounts_table_min_height)
+            .max(base_selected_height);
+        medium_selected_account_preferred_height(selected).min(max_dynamic_height)
+    } else {
+        base_selected_height
+    }
+    .min(area.height.saturating_sub(summary_height));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -513,9 +583,17 @@ fn render_medium_loaded(frame: &mut Frame, app: &mut App, area: Rect, outputs: &
         .split(area);
 
     render_usage_status(frame, app, chunks[0], outputs);
-    let selected_index = app.selected_index;
     render_selected_account(frame, app, chunks[1], &outputs[selected_index], outputs);
     render_accounts_table(frame, app, chunks[2], outputs);
+}
+
+fn medium_selected_account_preferred_height(selected: &UsageOutput) -> u16 {
+    let status_rows = 3
+        + usize::from(credits_status_line(selected).is_some())
+        + reset_credit_detail_rows(selected);
+    let limit_rows = 2 + selected.metrics.len().min(4);
+    let action_rows = 3;
+    (status_rows + limit_rows + action_rows + 2).clamp(9, 22) as u16
 }
 
 fn usage_top_column_percentages(width: u16) -> (u16, u16) {
@@ -554,8 +632,10 @@ fn render_usage_status(frame: &mut Frame, app: &mut App, area: Rect, outputs: &[
         return;
     }
 
-    let mut lines =
-        usage_status_summary_lines(app, outputs, inner.width as usize, inner.height as usize);
+    let diagnostic_reserve = diagnostic_line_reserve(app, inner.height as usize);
+    let summary_height = (inner.height as usize).saturating_sub(diagnostic_reserve);
+    let mut lines = usage_status_summary_lines(app, outputs, inner.width as usize, summary_height);
+    append_usage_diagnostic_lines(&mut lines, app, inner.width as usize, inner.height as usize);
 
     push_section_spacing(&mut lines, inner.height as usize);
     append_credit_bank_summary_lines(
@@ -761,6 +841,115 @@ fn usage_status_summary_lines(
         }
     }
     lines
+}
+
+fn diagnostic_line_reserve(app: &App, max_lines: usize) -> usize {
+    if app.usage_fetch_diagnostics.is_empty() {
+        0
+    } else if max_lines >= 7 {
+        3
+    } else {
+        2.min(max_lines.saturating_sub(1))
+    }
+}
+
+fn append_usage_diagnostic_lines(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    width: usize,
+    max_lines: usize,
+) {
+    if app.usage_fetch_diagnostics.is_empty() || lines.len() >= max_lines {
+        return;
+    }
+
+    let remaining = max_lines.saturating_sub(lines.len());
+    if remaining < 2 {
+        return;
+    }
+    if !lines.is_empty() && remaining >= 3 {
+        lines.push(Line::from(""));
+    }
+    if max_lines.saturating_sub(lines.len()) < 2 {
+        return;
+    }
+
+    lines.push(section_heading("Diagnostics", app));
+    let available = max_lines.saturating_sub(lines.len());
+    if available == 0 {
+        return;
+    }
+
+    let visible_count = if app.usage_fetch_diagnostics.len() > available && available > 1 {
+        available - 1
+    } else {
+        app.usage_fetch_diagnostics.len().min(available)
+    };
+    for diagnostic in visible_usage_diagnostics(&app.usage_fetch_diagnostics, visible_count) {
+        lines.push(usage_diagnostic_line(diagnostic, width));
+    }
+
+    let hidden_count = app
+        .usage_fetch_diagnostics
+        .len()
+        .saturating_sub(visible_count);
+    if hidden_count > 0 && lines.len() < max_lines {
+        lines.push(Line::from(Span::styled(
+            truncate_string(
+                &format!(
+                    "  +{} more issue{}",
+                    hidden_count,
+                    if hidden_count == 1 { "" } else { "s" }
+                ),
+                width,
+            ),
+            app.theme.subtle_text_style(),
+        )));
+    }
+}
+
+fn visible_usage_diagnostics(
+    diagnostics: &[UsageFetchDiagnostic],
+    visible_count: usize,
+) -> Vec<&UsageFetchDiagnostic> {
+    let visible_count = visible_count.min(diagnostics.len());
+    if visible_count >= diagnostics.len() {
+        return diagnostics.iter().collect();
+    }
+
+    let mut indexed: Vec<_> = diagnostics.iter().enumerate().collect();
+    indexed
+        .sort_by_key(|(index, diagnostic)| (diagnostic_severity_rank(diagnostic.severity), *index));
+    indexed.truncate(visible_count);
+    indexed
+        .into_iter()
+        .map(|(_, diagnostic)| diagnostic)
+        .collect()
+}
+
+fn diagnostic_severity_rank(severity: UsageFetchDiagnosticSeverity) -> u8 {
+    match severity {
+        UsageFetchDiagnosticSeverity::Error => 0,
+        UsageFetchDiagnosticSeverity::Warning => 1,
+        UsageFetchDiagnosticSeverity::Info => 2,
+    }
+}
+
+fn usage_diagnostic_line(diagnostic: &UsageFetchDiagnostic, width: usize) -> Line<'static> {
+    let label = diagnostic.display_name();
+    let text = format!("  {label}: {}", diagnostic.message);
+    Line::from(Span::styled(
+        truncate_string(&text, width),
+        Style::default().fg(diagnostic_severity_color(diagnostic.severity)),
+    ))
+}
+
+fn diagnostic_severity_color(severity: UsageFetchDiagnosticSeverity) -> Color {
+    match severity {
+        UsageFetchDiagnosticSeverity::Info => Color::Cyan,
+        UsageFetchDiagnosticSeverity::Warning => Color::Yellow,
+        UsageFetchDiagnosticSeverity::Error => Color::Red,
+    }
 }
 
 fn push_section_spacing(lines: &mut Vec<Line<'static>>, max_lines: usize) {
@@ -1006,7 +1195,7 @@ fn render_selected_account(
                 app,
                 "Credential",
                 if account.is_active {
-                    "saved store, active auth.json"
+                    "saved store, current Codex login"
                 } else {
                     "saved store"
                 },
@@ -1036,24 +1225,13 @@ fn render_selected_account(
             );
         }
     }
-    if lines.len() < detail_limit {
-        if let Some(label) = reset_credits_line(selected) {
-            push_kv_styled(
-                &mut lines,
-                app,
-                "Reset Bank",
-                &label,
-                if has_available_reset_credit(selected) {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    app.theme.secondary_text_style()
-                },
-                inner.width as usize,
-            );
-        }
-    }
+    append_selected_reset_credit_lines(
+        &mut lines,
+        app,
+        selected,
+        inner.width as usize,
+        detail_limit,
+    );
     push_section_spacing(&mut lines, detail_limit);
     if lines.len() < detail_limit {
         lines.push(section_heading("Limits", app));
@@ -1087,6 +1265,112 @@ fn render_selected_account(
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn append_selected_reset_credit_lines(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    selected: &UsageOutput,
+    width: usize,
+    max_lines: usize,
+) {
+    if lines.len() >= max_lines {
+        return;
+    }
+
+    let Some(credits) = selected.reset_credits.as_ref() else {
+        return;
+    };
+
+    let count_label = reset_credit_count_label(credits.available_count);
+    let value_style = if has_available_reset_credit(selected) {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        app.theme.secondary_text_style()
+    };
+    push_kv_styled(lines, app, "Reset Bank", &count_label, value_style, width);
+
+    if lines.len() >= max_lines {
+        return;
+    }
+
+    let buckets = reset_credit_buckets(credits);
+    if buckets.is_empty() {
+        if credits.available_count > 0 {
+            lines.push(selected_reset_schedule_line(
+                "expiry unknown",
+                app.theme.subtle_text_style(),
+                width,
+            ));
+        }
+        return;
+    }
+
+    // Leave room for the sections rendered after the reset schedule (a blank
+    // spacer, the "Limits" heading, at least one metric row, and the
+    // snapshot line) so a long expiry list can't push them off screen, while
+    // still keeping a small floor for an expiry line plus "+N more".
+    let trailing_rows_reserved = 4usize;
+    let expiry_budget = max_lines
+        .saturating_sub(trailing_rows_reserved)
+        .max(lines.len() + 2);
+    let available = expiry_budget.saturating_sub(lines.len());
+    let visible_count = if buckets.len() > available {
+        available.saturating_sub(1)
+    } else {
+        buckets.len()
+    };
+
+    for bucket in buckets.iter().take(visible_count) {
+        lines.push(selected_reset_schedule_line(
+            &format_selected_reset_schedule_entry(bucket),
+            app.theme.secondary_text_style(),
+            width,
+        ));
+    }
+
+    let hidden = hidden_expiry_count(&buckets[visible_count..]);
+    if hidden > 0 && lines.len() < max_lines {
+        lines.push(selected_reset_schedule_line(
+            &format!("+{hidden} more reset credits"),
+            app.theme.subtle_text_style(),
+            width,
+        ));
+    }
+}
+
+fn selected_reset_schedule_line(value: &str, value_style: Style, width: usize) -> Line<'static> {
+    let prefix_width = 14usize;
+    Line::from(vec![
+        Span::raw(" ".repeat(prefix_width)),
+        Span::styled(
+            truncate_string(value, width.saturating_sub(prefix_width + 2)),
+            value_style,
+        ),
+    ])
+}
+
+fn format_selected_reset_schedule_entry(bucket: &(String, usize)) -> String {
+    if bucket.1 > 1 {
+        format!("x{} expires {}", bucket.1, bucket.0)
+    } else {
+        format!("expires {}", bucket.0)
+    }
+}
+
+fn reset_credit_detail_rows(selected: &UsageOutput) -> usize {
+    let Some(credits) = selected.reset_credits.as_ref() else {
+        return 0;
+    };
+
+    if credits.available_count == 0 {
+        return 1;
+    }
+
+    let bucket_count = reset_credit_buckets(credits).len();
+    1 + bucket_count.max(1)
 }
 
 fn append_credit_bank_summary_lines(
@@ -1146,10 +1430,10 @@ fn reset_credit_account_line(
     } else {
         format!("{} credits", credits.available_count)
     };
-    let expiry = credit_expiry_summary(credits);
     let label_width: usize = if width >= 72 { 28 } else { 18 };
     let count_width: usize = if width >= 72 { 12 } else { 10 };
     let used = 2 + label_width + count_width + 2;
+    let expiry = credit_nearest_expiry_line(credits);
     let marker = if selected { "> " } else { "  " };
     Line::from(vec![
         Span::raw(marker),
@@ -1174,27 +1458,54 @@ fn reset_credit_account_line(
     ])
 }
 
-fn credit_expiry_summary(credits: &crate::commands::usage::UsageResetCredits) -> String {
-    let mut expiries: Vec<String> = credits
-        .credits
-        .iter()
-        .filter_map(|credit| credit.expires_at.as_deref())
-        .map(format_credit_expiry_label)
-        .collect();
-    expiries.sort();
-    expiries.dedup();
+fn reset_credit_buckets(
+    credits: &crate::commands::usage::UsageResetCredits,
+) -> Vec<(String, usize)> {
+    credit_expiry_buckets(
+        credits
+            .credits
+            .iter()
+            .filter_map(|credit| credit.expires_at.as_deref()),
+    )
+}
 
-    if expiries.is_empty() {
-        return "expiry unknown".to_string();
+fn credit_nearest_expiry_line(credits: &crate::commands::usage::UsageResetCredits) -> String {
+    nearest_credit_expiry_label(&reset_credit_buckets(credits))
+        .unwrap_or_else(|| "expiry unknown".to_string())
+}
+
+fn nearest_credit_expiry_label(buckets: &[(String, usize)]) -> Option<String> {
+    buckets
+        .first()
+        .map(|bucket| format!("nearest expires {}", bucket.0))
+}
+
+fn credit_expiry_buckets<'a>(expiries: impl Iterator<Item = &'a str>) -> Vec<(String, usize)> {
+    let mut values: Vec<String> = expiries.map(str::to_string).collect();
+    // Sort by the raw RFC3339 value so buckets stay in chronological order,
+    // then group by the formatted label below, since `format_reset_time` has
+    // only minute granularity and would otherwise render two entries whose
+    // raw timestamps differ only by seconds as separate identical lines.
+    values.sort();
+
+    let mut buckets: Vec<(String, usize)> = Vec::new();
+    for value in values {
+        let label = format_credit_expiry_label(&value);
+        if let Some(last) = buckets
+            .last_mut()
+            .filter(|(last_label, _)| *last_label == label)
+        {
+            last.1 += 1;
+            continue;
+        }
+        buckets.push((label, 1));
     }
 
-    let visible: Vec<String> = expiries.iter().take(2).cloned().collect();
-    let hidden = expiries.len().saturating_sub(visible.len());
-    if hidden > 0 {
-        format!("expires {} +{hidden}", visible.join(", "))
-    } else {
-        format!("expires {}", visible.join(", "))
-    }
+    buckets
+}
+
+fn hidden_expiry_count(buckets: &[(String, usize)]) -> usize {
+    buckets.iter().map(|(_, count)| *count).sum()
 }
 
 fn format_credit_expiry_label(value: &str) -> String {
@@ -1235,7 +1546,6 @@ fn selected_account_actions_line(
             let x = area
                 .x
                 .saturating_add(Line::from(spans.clone()).width() as u16);
-            buttons.push(remove_account_button(&account.id));
             push_click_buttons(&mut spans, app, buttons, x, y, area.right());
         } else {
             spans.push(Span::raw("  "));
@@ -2074,6 +2384,14 @@ fn has_available_reset_credit(output: &UsageOutput) -> bool {
             .is_some_and(|credits| credits.available_count > 0)
 }
 
+fn reset_credit_count_label(count: u32) -> String {
+    if count == 1 {
+        "1 available".to_string()
+    } else {
+        format!("{count} available")
+    }
+}
+
 fn reset_bank_summary(outputs: &[UsageOutput]) -> String {
     let available: u32 = outputs
         .iter()
@@ -2085,43 +2403,23 @@ fn reset_bank_summary(outputs: &[UsageOutput]) -> String {
         return "No reset credits".to_string();
     }
 
-    let nearest_expiry = outputs
-        .iter()
-        .filter_map(|output| output.reset_credits.as_ref())
-        .flat_map(|credits| credits.credits.iter())
-        .filter_map(|credit| credit.expires_at.as_deref())
-        .min()
-        .map(format_expiry_time);
+    let expiries = credit_expiry_buckets(
+        outputs
+            .iter()
+            .filter_map(|output| output.reset_credits.as_ref())
+            .flat_map(|credits| credits.credits.iter())
+            .filter_map(|credit| credit.expires_at.as_deref()),
+    );
 
     let count = if available == 1 {
-        "1 available".to_string()
+        reset_credit_count_label(available)
     } else {
         format!("{available} available across accounts")
     };
-    match nearest_expiry {
-        Some(expiry) => format!("{count} · nearest {expiry}"),
+    match nearest_credit_expiry_label(&expiries) {
+        Some(nearest) => format!("{count} · {nearest}"),
         None => count,
     }
-}
-
-fn reset_credits_line(output: &UsageOutput) -> Option<String> {
-    let credits = output.reset_credits.as_ref()?;
-    let count = credits.available_count;
-    let mut label = if count == 1 {
-        "1 available".to_string()
-    } else {
-        format!("{count} available")
-    };
-    if let Some(expiry) = credits
-        .credits
-        .iter()
-        .filter_map(|credit| credit.expires_at.as_deref())
-        .min()
-    {
-        label.push_str(" · ");
-        label.push_str(&format_expiry_time(expiry));
-    }
-    Some(label)
 }
 
 fn credits_status_line(output: &UsageOutput) -> Option<String> {
@@ -2198,7 +2496,8 @@ fn styled<T: Into<String>>(text: T, style: Style, selected: bool) -> Span<'stati
 mod tests {
     use super::*;
     use crate::commands::usage::{
-        UsageAccount, UsageCreditStatus, UsageResetCredit, UsageResetCredits, UsageSpendControl,
+        UsageAccount, UsageCreditStatus, UsageFetchDiagnostic, UsageFetchDiagnosticKind,
+        UsageFetchDiagnosticSeverity, UsageResetCredit, UsageResetCredits, UsageSpendControl,
     };
     use crate::tui::app::{Tab, TuiConfig};
     use crate::tui::data::UsageData;
@@ -2251,6 +2550,30 @@ mod tests {
                 title: Some("One free rate limit reset".to_string()),
                 description: None,
             }],
+        });
+        output
+    }
+
+    fn output_with_reset_credit_expiries(
+        provider: &str,
+        account: Option<UsageAccount>,
+        expiries: &[&str],
+    ) -> UsageOutput {
+        let mut output = output(provider, account);
+        output.reset_credits = Some(UsageResetCredits {
+            available_count: expiries.len() as u32,
+            credits: expiries
+                .iter()
+                .enumerate()
+                .map(|(index, expiry)| UsageResetCredit {
+                    id: Some(format!("credit_{index}")),
+                    status: Some("available".to_string()),
+                    reset_type: Some("codex_rate_limits".to_string()),
+                    expires_at: Some((*expiry).to_string()),
+                    title: Some("One free rate limit reset".to_string()),
+                    description: None,
+                })
+                .collect(),
         });
         output
     }
@@ -2485,6 +2808,7 @@ mod tests {
     #[test]
     fn renders_usage_workspace_sections_and_codex_actions() {
         let mut app = make_app();
+        app.selected_index = 1;
         app.subscription_usage = vec![
             output(
                 "Codex",
@@ -2516,6 +2840,120 @@ mod tests {
         assert!(body.contains("personal"), "{body}");
         assert!(body.contains(" Remove "), "{body}");
         assert!(body.contains("Show Emails"), "{body}");
+    }
+
+    #[test]
+    fn usage_summary_reserves_space_for_diagnostics() {
+        let mut app = make_app();
+        app.usage_fetch_diagnostics = vec![UsageFetchDiagnostic::new(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_personal".to_string(),
+                label: Some("personal".to_string()),
+                is_active: false,
+            }),
+            "usage endpoint rejected credentials",
+        )];
+        let outputs = vec![output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+        )];
+        let max_lines = 6;
+        let reserve = diagnostic_line_reserve(&app, max_lines);
+        let mut lines = usage_status_summary_lines(&app, &outputs, 80, max_lines - reserve);
+        append_usage_diagnostic_lines(&mut lines, &app, 80, max_lines);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Diagnostics"), "{rendered}");
+        assert!(rendered.contains("usage endpoint rejected"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_summary_reserve_keeps_space_at_tiny_heights() {
+        let mut app = make_app();
+        app.usage_fetch_diagnostics = vec![UsageFetchDiagnostic::new(
+            "Codex",
+            None,
+            "usage endpoint failed",
+        )];
+
+        assert_eq!(diagnostic_line_reserve(&app, 0), 0);
+        assert_eq!(diagnostic_line_reserve(&app, 1), 0);
+        assert_eq!(diagnostic_line_reserve(&app, 2), 1);
+        assert_eq!(diagnostic_line_reserve(&app, 6), 2);
+    }
+
+    #[test]
+    fn usage_summary_compacts_hidden_diagnostics() {
+        let mut app = make_app();
+        app.usage_fetch_diagnostics = vec![
+            UsageFetchDiagnostic::new("Codex", None, "first issue"),
+            UsageFetchDiagnostic::new("Claude", None, "second issue"),
+            UsageFetchDiagnostic::new("Amp", None, "third issue"),
+        ];
+        let mut lines = Vec::new();
+
+        append_usage_diagnostic_lines(&mut lines, &app, 80, 3);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Diagnostics"), "{rendered}");
+        assert!(rendered.contains("first issue"), "{rendered}");
+        assert!(rendered.contains("+2 more issues"), "{rendered}");
+        assert!(!rendered.contains("second issue"), "{rendered}");
+    }
+
+    #[test]
+    fn usage_summary_prioritizes_error_diagnostics_when_compacted() {
+        let mut app = make_app();
+        app.usage_fetch_diagnostics = vec![
+            UsageFetchDiagnostic::with_kind(
+                "Claude",
+                None,
+                UsageFetchDiagnosticKind::FetchFailed,
+                UsageFetchDiagnosticSeverity::Info,
+                "low priority issue",
+            ),
+            UsageFetchDiagnostic::with_kind(
+                "Amp",
+                None,
+                UsageFetchDiagnosticKind::FetchFailed,
+                UsageFetchDiagnosticSeverity::Warning,
+                "medium priority issue",
+            ),
+            UsageFetchDiagnostic::with_kind(
+                "Codex",
+                None,
+                UsageFetchDiagnosticKind::FetchFailed,
+                UsageFetchDiagnosticSeverity::Error,
+                "high priority issue",
+            ),
+        ];
+        let mut lines = Vec::new();
+
+        append_usage_diagnostic_lines(&mut lines, &app, 80, 3);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Diagnostics"), "{rendered}");
+        assert!(rendered.contains("high priority issue"), "{rendered}");
+        assert!(rendered.contains("+2 more issues"), "{rendered}");
+        assert!(!rendered.contains("low priority issue"), "{rendered}");
+        assert!(!rendered.contains("medium priority issue"), "{rendered}");
     }
 
     #[test]
@@ -2674,7 +3112,135 @@ mod tests {
     }
 
     #[test]
-    fn selected_account_panel_aligns_detail_sections() {
+    fn usage_reset_bank_summarizes_nearest_and_expands_selected_expiries() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output_with_reset_credit_expiries(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+            &["reset-a", "reset-b", "reset-c", "reset-d"],
+        )];
+
+        let body = render_body(&mut app, 180, 32);
+        let credit_account = body
+            .lines()
+            .find(|line| line.contains("4 credits"))
+            .expect("missing credit account row");
+
+        assert!(body.contains("4 available"), "{body}");
+        assert!(
+            credit_account.contains("nearest expires reset-a"),
+            "{credit_account}"
+        );
+        assert!(!credit_account.contains("reset-b"), "{credit_account}");
+        assert!(body.contains("expires reset-a"), "{body}");
+        assert!(!body.contains("scheduled resets"), "{body}");
+        assert!(!body.contains("Schedule"), "{body}");
+        // This panel is short enough that the reset schedule must budget room
+        // for the Limits/metrics sections rendered after it, so the rest of
+        // the expiry list collapses into "+N more" instead of evicting them.
+        assert!(body.contains("more reset credits"), "{body}");
+        assert!(!body.contains("expires reset-d"), "{body}");
+        assert!(body.contains("Limits"), "{body}");
+    }
+
+    #[test]
+    fn wide_usage_reset_schedule_budgets_room_for_metrics_and_snapshot() {
+        let mut app = make_app();
+        let expiries: Vec<String> = (0..9).map(|index| format!("reset-{index}")).collect();
+        let expiries: Vec<&str> = expiries.iter().map(String::as_str).collect();
+        app.subscription_usage = vec![output_with_reset_credit_expiries(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+            &expiries,
+        )];
+
+        let body = render_body(&mut app, 180, 42);
+
+        assert!(body.contains("9 available"), "{body}");
+        assert!(body.contains("more reset credits"), "{body}");
+        assert!(body.contains("Limits"), "{body}");
+        assert!(body.contains("90% left"), "{body}");
+        assert!(body.contains("Snapshot"), "{body}");
+    }
+
+    #[test]
+    fn medium_usage_reset_bank_keeps_selected_expiries_visible() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output_with_reset_credit_expiries(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+            &["reset-a", "reset-b", "reset-c", "reset-d"],
+        )];
+
+        let body = render_body(&mut app, 120, 36);
+
+        assert!(body.contains("Reset Bank"), "{body}");
+        assert!(body.contains("4 available"), "{body}");
+        assert!(body.contains("expires reset-a"), "{body}");
+        assert!(body.contains("expires reset-d"), "{body}");
+        assert!(!body.contains("scheduled resets"), "{body}");
+        assert!(!body.contains("Schedule"), "{body}");
+        assert!(!body.contains("+2"), "{body}");
+    }
+
+    #[test]
+    fn medium_usage_short_height_keeps_accounts_table_visible() {
+        let mut app = make_app();
+        app.subscription_usage = vec![
+            output_with_reset_credits(
+                "Codex",
+                Some(UsageAccount {
+                    id: "acct_work".to_string(),
+                    label: Some("work".to_string()),
+                    is_active: true,
+                }),
+                1,
+            ),
+            output(
+                "Codex",
+                Some(UsageAccount {
+                    id: "acct_beta".to_string(),
+                    label: Some("acct-beta".to_string()),
+                    is_active: false,
+                }),
+            ),
+            output(
+                "Codex",
+                Some(UsageAccount {
+                    id: "acct_gamma".to_string(),
+                    label: Some("acct-gamma".to_string()),
+                    is_active: false,
+                }),
+            ),
+        ];
+
+        let body = render_body(&mut app, 120, 28);
+
+        assert!(body.contains("Accounts"), "{body}");
+        assert!(
+            body.contains("acct-beta"),
+            "non-selected account should stay visible in the accounts table: {body}"
+        );
+        assert!(
+            body.contains("acct-gamma"),
+            "non-selected account should stay visible in the accounts table: {body}"
+        );
+    }
+
+    #[test]
+    fn medium_usage_120x24_accounts_table_is_not_collapsed() {
         let mut app = make_app();
         app.subscription_usage = vec![output_with_reset_credits(
             "Codex",
@@ -2683,10 +3249,100 @@ mod tests {
                 label: Some("work".to_string()),
                 is_active: true,
             }),
-            2,
+            1,
+        )];
+
+        let body = render_body(&mut app, 120, 24);
+
+        assert!(
+            body.contains("Account / Status"),
+            "accounts table header should still render at a short height: {body}"
+        );
+    }
+
+    #[test]
+    fn reset_credit_account_line_uses_nearest_expiry_only() {
+        let app = make_app();
+        let output = output_with_reset_credit_expiries(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
+            &["reset-a", "reset-b", "reset-c", "reset-d"],
+        );
+        let credits = output.reset_credits.as_ref().unwrap();
+
+        let line = line_text(&reset_credit_account_line(&app, &output, credits, true, 80));
+
+        assert!(line.contains("4 credits"), "{line}");
+        assert!(line.contains("nearest expires reset-a"), "{line}");
+        assert!(!line.contains("reset-b"), "{line}");
+    }
+
+    #[test]
+    fn selected_reset_schedule_groups_duplicate_expiries() {
+        let output =
+            output_with_reset_credit_expiries("Codex", None, &["reset-a", "reset-a", "reset-b"]);
+        let credits = output.reset_credits.as_ref().unwrap();
+
+        let buckets = reset_credit_buckets(credits);
+
+        assert_eq!(
+            format_selected_reset_schedule_entry(&buckets[0]),
+            "x2 expires reset-a"
+        );
+        assert_eq!(
+            format_selected_reset_schedule_entry(&buckets[1]),
+            "expires reset-b"
+        );
+    }
+
+    #[test]
+    fn reset_credit_buckets_sort_raw_expiry_values_before_formatting() {
+        let buckets = credit_expiry_buckets(["reset-b", "reset-a", "reset-a"].into_iter());
+
+        assert_eq!(buckets[0], ("reset-a".to_string(), 2));
+        assert_eq!(buckets[1], ("reset-b".to_string(), 1));
+    }
+
+    #[test]
+    fn credit_expiry_buckets_group_same_minute_different_seconds() {
+        let buckets = credit_expiry_buckets(
+            [
+                "2030-06-15T09:20:00Z",
+                "2030-06-15T09:15:20Z",
+                "2030-06-15T09:15:00Z",
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(buckets.len(), 2, "{buckets:?}");
+        assert_eq!(
+            buckets[0],
+            (format_credit_expiry_label("2030-06-15T09:15:00Z"), 2)
+        );
+        assert_eq!(
+            buckets[1],
+            (format_credit_expiry_label("2030-06-15T09:20:00Z"), 1)
+        );
+    }
+
+    #[test]
+    fn selected_account_panel_aligns_detail_sections() {
+        let mut app = make_app();
+        app.subscription_usage = vec![output(
+            "Codex",
+            Some(UsageAccount {
+                id: "acct_work".to_string(),
+                label: Some("work".to_string()),
+                is_active: true,
+            }),
         )];
 
         let body = render_body(&mut app, 180, 32);
+        assert!(body.contains("current Codex login"), "{body}");
         let status_line = body
             .lines()
             .find(|line| line.contains("Status") && line.contains("Ready"))
@@ -2714,6 +3370,7 @@ mod tests {
         assert_eq!(selected_col, visual_col(metric_line, "5h"));
         assert_eq!(selected_col, visual_col(actions_line, "Actions"));
         assert_eq!(selected_col, visual_col(current_line, "Current account"));
+        assert!(!current_line.contains("Remove"), "{current_line}");
     }
 
     #[test]
@@ -2889,6 +3546,7 @@ mod tests {
     #[test]
     fn narrow_usage_keeps_account_actions_visible() {
         let mut app = make_app();
+        app.selected_index = 1;
         app.subscription_usage = vec![
             output(
                 "Codex",
