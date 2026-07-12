@@ -95,6 +95,8 @@ pub struct ScanResult {
     pub micode_dbs: Vec<PathBuf>,
     /// Path to the OpenCode legacy JSON directory (for migration cache stat checks)
     pub opencode_json_dir: Option<PathBuf>,
+    /// Devin CLI SQLite database at `~/.local/share/devin/cli/sessions.db`.
+    pub devin_db: Option<PathBuf>,
 }
 
 impl Default for ScanResult {
@@ -113,6 +115,7 @@ impl Default for ScanResult {
             zcode_db: None,
             micode_dbs: Vec::new(),
             opencode_json_dir: None,
+            devin_db: None,
         }
     }
 }
@@ -275,6 +278,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "*.json" => file_name.ends_with(".json"),
                 "*.json|*.jsonl" => file_name.ends_with(".json") || file_name.ends_with(".jsonl"),
                 "*.jsonl" => file_name.ends_with(".jsonl"),
+                "*.ndjson" => file_name.ends_with(".ndjson"),
                 "*.log" => file_name.ends_with(".log"),
                 "codebuddy-extension-log" => {
                     file_name.ends_with(".log")
@@ -795,6 +799,23 @@ fn cline_additional_vscode_task_roots(home_dir: &str, use_env_roots: bool) -> Ve
         PathBuf::from(home_dir)
             .join(".vscode-server/data/User/globalStorage/saoudrizwan.claude-dev/tasks"),
     );
+
+    roots
+}
+
+fn devin_desktop_additional_roots(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from(home_dir).join(".config/Devin/User/acp-events"),
+        PathBuf::from(home_dir).join(".config/devin/User/acp-events"),
+    ];
+
+    if cfg!(target_os = "windows") && use_env_roots {
+        if let Some(app_data) = std::env::var_os("APPDATA").filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(app_data).join("Devin/User/acp-events"));
+        }
+    }
+
+    roots.push(PathBuf::from(home_dir).join("AppData/Roaming/Devin/User/acp-events"));
 
     roots
 }
@@ -1346,12 +1367,42 @@ fn scan_all_clients_with_env_strategy_inner(
         }
     }
 
+    if enabled.contains(&ClientId::DevinDesktop) {
+        let local_path = ClientId::DevinDesktop
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        push_unique_scan_task(
+            &mut tasks,
+            &mut seen_scan_roots,
+            ClientId::DevinDesktop,
+            local_path,
+        );
+
+        for root in devin_desktop_additional_roots(home_dir, use_env_roots) {
+            push_unique_scan_task(
+                &mut tasks,
+                &mut seen_scan_roots,
+                ClientId::DevinDesktop,
+                root,
+            );
+        }
+    }
+
     if enabled.contains(&ClientId::Kilo) {
         let kilo_db_path = ClientId::Kilo
             .data()
             .resolve_path_with_env_strategy(home_dir, use_env_roots);
         if std::path::Path::new(&kilo_db_path).exists() {
             result.kilo_db = Some(PathBuf::from(kilo_db_path));
+        }
+    }
+
+    if enabled.contains(&ClientId::DevinCli) {
+        let devin_db_path = ClientId::DevinCli
+            .data()
+            .resolve_path_with_env_strategy(home_dir, use_env_roots);
+        if std::path::Path::new(&devin_db_path).exists() {
+            result.devin_db = Some(PathBuf::from(devin_db_path));
         }
     }
 
