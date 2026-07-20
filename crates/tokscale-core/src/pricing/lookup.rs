@@ -2388,6 +2388,16 @@ mod tests {
                 ..Default::default()
             },
         );
+        m.insert(
+            "gemini-3.5-flash".into(),
+            ModelPricing {
+                input_cost_per_token: Some(1.5e-6),
+                output_cost_per_token: Some(9e-6),
+                cache_read_input_token_cost: Some(1.5e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
 
         // === OpenCode Zen: Grok (LiteLLM entry) ===
         m.insert(
@@ -2758,6 +2768,24 @@ mod tests {
         let result = lookup.lookup("gemini-3-flash").unwrap();
         assert_eq!(result.matched_key, "vertex_ai/gemini-3-flash-preview");
         assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_gemini_3_5_flash_alias_from_antigravity() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gemini-3.5-flash").unwrap();
+        assert_eq!(result.matched_key, "gemini-3.5-flash");
+        assert_eq!(result.source, "LiteLLM");
+
+        // Verify correct 3.5 Flash Developer API pricing (paid tier)
+        // $1.50 / $9.00 / $0.15 per 1M tokens (input / output / cache read)
+        assert_eq!(result.pricing.input_cost_per_token, Some(1.5e-6));
+        assert_eq!(result.pricing.output_cost_per_token, Some(9e-6));
+        assert_eq!(result.pricing.cache_read_input_token_cost, Some(1.5e-7));
+
+        // gemini-3-flash-a (from Antigravity CLI gen_metadata) should route to 3.5
+        let via_raw = lookup.lookup("gemini-3-flash-a").unwrap();
+        assert_eq!(via_raw.matched_key, "gemini-3.5-flash");
     }
 
     // =========================================================================
